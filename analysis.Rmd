@@ -1,0 +1,1961 @@
+---
+title: "Untitled"
+author: "Thomas Y. Michaelsen"
+date: "1/18/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# Load R-packages needed for analysis.
+library(tidyverse)
+library(Biostrings)
+library(ape)
+library(ggtree)
+library(MASS)
+library(tidytree)
+library(zoo)
+library(readxl)
+library(ISOweek)
+library(igraph)
+library(cowplot)
+library(sf)
+library(ggrepel)
+library(tidygraph)
+library(ggraph)
+library(glmmTMB)
+library(AICcmodavg)
+
+# Mapping Danish to English regional names. 
+regTOeng <- setNames(
+  nm     = c("Nordjylland",  "Midtjylland",    "Syddanmark",      "Sjælland","Hovedstaden"),
+  object = c("North",        "Central",        "South",           "Zealand",  "Capital"))
+
+# Setup colourscheme for regions.
+regioner_col <- c(
+  "North"    = "#edae49",
+  "Central"  = "#d1495b",
+  "South"    = "#CC79A7",
+  "Zealand"  = "#66a182",
+  "Capital"  = "#00798c")
+```
+
+# Basic stats and modelling
+
+# Load data
+
+```{r}
+# Read DK metadata.-------------------------------------------------------------
+meta_wholeDK <- read_tsv("../data/DK/2021-04-17-10-03_linelist2021-04-17.tsv",
+  guess_max = 1000000) %>%
+  filter(host == "human") %>%
+  mutate(Region = recode(Region,!!!regTOeng))
+
+# make a variable to store ordered week labels.
+wks_lvl <- unique(meta_wholeDK$date_linelist) %>% ISOweek() %>% unique() %>% sort()
+
+# Tidy.
+meta_wholeDK <- meta_wholeDK %>%
+  mutate(date_week_iso = ISOweek(date_linelist) %>% factor(levels = wks_lvl)) %>%
+  mutate(date_week     = lubridate::floor_date(date_linelist,unit = "week",week_start = 1)) %>%
+  unite(nt_substitutions,nt_deletions,col = "nt_mutations",sep = ",",na.rm = T) 
+
+# Read the metadata for sequences used for import study.------------------------
+meta_intro <- read_csv("../data/2021-04-19-08-36_B117-globDK.csv",guess_max = 10000)
+
+# make a variable to store ordered week labels.
+wks_lvl <- unique(meta_intro$date) %>% ISOweek() %>% unique() %>% sort()
+
+# Tidy.
+meta_intro <- meta_intro %>%
+  mutate(date_week_iso = ISOweek(date) %>% factor(levels = wks_lvl)) %>%
+  mutate(date_week     = lubridate::floor_date(date,unit = "week",week_start = 1)) %>%
+  mutate(Region = recode(Region,!!!regTOeng)) %>%
+  mutate(Region = recode(Region,Sjaelland = "Zealand"))
+
+# Read DK seqlab data to map ssi_id's to a unique CPR.--------------------------
+meta_seqlab <- read_tsv("../data/DK/2021-04-17-10-03_seqlabdata.tsv",
+  guess_max = 1000000)
+
+ssiTOcpr <- read_csv("../data/DK/2021-04-18-15-00_B117-DK-raw.csv") %>%
+  select(ID_old) %>%
+  left_join(meta_seqlab,by = c("ID_old" = "ssi_id")) %>%
+  select(ID_old,CPR,date_sampling) %>%
+  unique()
+
+# Set the ranges in dates of the two study periods:
+# 1) covering the period for phylodynamic analysis 
+# 2) covering the statistical modelling period.
+
+dates_model  <- c("2021-01-04","2021-02-07") %>% as.Date()
+dates_import <- c("2020-11-14","2021-02-07") %>% as.Date()
+mindate      <- "2020-11-02" %>% as.Date()
+maxdate      <- "2021-03-21" %>% as.Date()
+
+# Breaks by week - for plotting.
+brk1week_whole <- seq(
+  lubridate::floor_date(mindate,unit = "week",week_start = 1),
+  lubridate::ceiling_date(maxdate,unit = "week",week_start = 1),
+  by = "week")
+
+# Breaks by month - for plotting.
+brk_mth <- data.frame(
+  date = seq(as.Date("2020-10-01"),as.Date("2021-03-01"),by = "month"),
+  stringsAsFactors = F) %>%
+  mutate(nm = format(date,"%b") %>% ifelse(. == "Jan","Jan\n2021",.))
+
+# Read the travel data----------------------------------------------------------
+# Read the M49 country code.
+M49 <- read_csv("../data/2021-04-21_M49code-curated.csv")
+
+# Rename regions from Danish to English.
+countryTOsubreg <- setNames(
+  object = M49$subregion2,
+  nm     = M49$country)
+
+# Read and tidy travel data - all cases.
+travel_all <- read_excel("../data/STPS_kontaktopsporing_Alle_31052021.xlsx",guess_max = 1000000) %>%
+    mutate(travel = case_when(
+    Udlandsophold == "Ja"      ~ "Yes",
+    Udlandsophold == "Nej"     ~ "No",
+    Udlandsophold == "0"       ~ "Unknown",
+    Udlandsophold == "Uoplyst" ~ "Unknown",
+    is.na(Udlandsophold)       ~ "Unknown")) %>%
+  mutate(country_to = ifelse(is.na(travel),"",ifelse(travel == "Yes",Lande,""))) %>%
+  select(-Udlandsophold,-Lande) %>%
+  mutate(country_to = recode(country_to,
+    Albanien                                           = "Albania",
+    `Bosnien-Herzegovina`                              = "Bosnia and Herzegovina",
+    Elfenbenskysten                                    = "Côte d'Ivoire",
+    Færøerne                                           = "Faroe Islands",
+    `Forenede Arabiske Emirater inkl Dubai`            = "United Arab Emirates",
+    Frankrig                                           = "France",
+    `Grækenland inkl. øer (Kreta, Rhodos m fl)`        = "Greece",
+    `Holland/Nederlandene`                             = "Netherlands",
+    Libanon                                            = "Lebanon",
+    Polen                                              = "Poland",
+    Rumænien                                           = "Romania",
+    `Saudi Arabien`                                    = "Saudi Arabia",
+    Slovakiet                                          = "Slovakia",
+    Spanien                                            = "Spain",
+    `Storbritannien og Nordirland/Skotland/UK/England` = "United Kingdom",
+    Sverige                                            = "Sweden",
+    `Tanzania inkl. Zanzibar`                          = "United Republic of Tanzania",
+    `Tjekkiet/Den Tjekkiske Republik`                  = "Czech Republic",
+    Tyrkiet                                            = "Turkey",
+    Tyskland                                           = "Germany",
+    `Ægypten/Egypten`                                  = "Egypt")) %>%
+  mutate(groups = recode(country_to,!!!countryTOsubreg))
+
+# Pick all travelers in the study period and tabulate the numbers.
+traveltab_all <- travel_all %>%
+  select(CPR,travel,country_to) %>%
+  mutate(nchars = sapply(CPR,nchar)) %>%
+  filter(nchars == 10 & CPR != "0000000000") %>%
+  filter(travel == "Yes") %>%
+  left_join(select(meta_wholeDK,CPR,date_linelist),by = "CPR") %>%
+  filter(date_linelist >= dates_import[1] & date_linelist <= dates_import[2]) %>%
+  count(country_to) %>%
+  arrange(-n)
+traveltab_all
+
+# Read and tidy travel data - study-related cases.
+travel <- read_excel("../data/2021-04-19_all-cases_med_rejsehistorik.xlsx") %>%
+  mutate(travel = case_when(
+    Rejse == "Ja"      ~ "Yes",
+    Rejse == "Nej"     ~ "No",
+    Rejse == "0"       ~ "Unknown",
+    Rejse == "Uoplyst" ~ "Unknown",
+    is.na(Rejse)       ~ "Unknown")) %>%
+  mutate(country_to = ifelse(is.na(travel),"",ifelse(travel == "Yes",Lande,""))) %>%
+  select(-Rejse,-Lande) %>%
+  mutate(country_to = recode(country_to,
+    Albanien                                           = "Albania",
+    `Bosnien-Herzegovina`                              = "Bosnia and Herzegovina",
+    Elfenbenskysten                                    = "Côte d'Ivoire",
+    Færøerne                                           = "Faroe Islands",
+    `Forenede Arabiske Emirater inkl Dubai`            = "United Arab Emirates",
+    Frankrig                                           = "France",
+    `Grækenland inkl. øer (Kreta, Rhodos m fl)`        = "Greece",
+    `Holland/Nederlandene`                             = "Netherlands",
+    Libanon                                            = "Lebanon",
+    Polen                                              = "Poland",
+    Rumænien                                           = "Romania",
+    `Saudi Arabien`                                    = "Saudi Arabia",
+    Slovakiet                                          = "Slovakia",
+    Spanien                                            = "Spain",
+    `Storbritannien og Nordirland/Skotland/UK/England` = "United Kingdom",
+    Sverige                                            = "Sweden",
+    `Tanzania inkl. Zanzibar`                          = "United Republic of Tanzania",
+    `Tjekkiet/Den Tjekkiske Republik`                  = "Czech Republic",
+    Tyrkiet                                            = "Turkey",
+    Tyskland                                           = "Germany")) %>%
+  mutate(groups = recode(country_to,!!!countryTOsubreg))
+
+# tabulate countries and check that data protection rules are respected.
+inner_join(
+  count(travel,country_to,name = "n_in") %>%
+    filter(country_to %in% c("United Arab Emirates","United Kingdom","Pakistan")),
+  traveltab_all %>%
+    filter(country_to %in% c("United Arab Emirates","United Kingdom","Pakistan")),
+  by = "country_to") %>%
+  mutate(pct = round(n_in/n*100,1))
+
+# Asses distributions of travel and more.
+travelstat <- left_join(meta_intro,select(travel,ID_old,travel,country_to),by = "ID_old") %>%
+  filter(country == "Denmark")
+
+p_travelstat <- ggplot(travelstat,aes(x = date_week)) + 
+  facet_wrap(facets = vars(travel),ncol = 1,scales = "free_y") +
+  labs(x = NULL,title = "Travel data across time") +
+  geom_bar(position = position_nudge(x = 3.5)) +
+  scale_x_date(expand = c(0,0),date_breaks = "1 month",date_labels = "%b %d") +
+  # Add grey areas.
+  annotate("rect",xmin = min(travelstat$date_week)-1,xmax = min(c(dates_import,dates_model)),ymin = -Inf,ymax = Inf,alpha = .2) +
+  annotate("rect",xmin = max(c(dates_import,dates_model)),xmax = max(travelstat$date)+1,ymin = -Inf,ymax = Inf,alpha = .2) +
+  # Add vertical lines.
+  geom_vline(xintercept = min(dates_model),linetype = "dashed",size = .2) +
+  geom_vline(xintercept = max(dates_model),linetype = "dashed",size = .2) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90))
+
+ggsave(p_travelstat,filename = "figures/dist-travel-data.png",dpi = 300,device = "png",width = 6,height = 6)
+
+# Population numbers by region.-------------------------------------------------
+REGpop <- c(
+  "Capital" = 1.855*10^6,
+  "Central" = 1.332*10^6,
+  "North"   = 0.590*10^6,
+  "Zealand"         = 0.839*10^6,
+  "South" = 1.224*10^6) %>%
+  {data.frame(Region = names(.),popsize = .,stringsAsFactors = F)} %>%
+  mutate(Region = factor(Region,levels = names(regioner_col)))
+
+# Number of tested per day.-----------------------------------------------------
+# Downloaded from here: https://covid19.ssi.dk/overvagningsdata/download-fil-med-overvaagningdata
+tested <- read_delim("../data/Data-Epidemiologiske-Rapport-07042021-mu34/Municipality_tested_persons_time_series.csv",delim = ";") %>%
+  select(-X101) %>%
+  dplyr::rename(København = Copenhagen,date = PrDate_adjusted) %>%
+  pivot_longer(cols = -date) %>%
+  filter(date >= mindate & date <= maxdate) 
+
+# Map muncipality to Region.
+path     <- "https://dawa.aws.dk/kommuner"
+request  <- httr::GET(url = path)
+response <- httr::content(request, as = "text", encoding = "UTF-8")
+
+muncipal2reg <- jsonlite::fromJSON(response, flatten = TRUE) %>%
+  data.frame() %>%
+  select(navn,region.navn) %>%
+  mutate(Region = sub("Region ","",region.navn)) %>%
+  mutate(Region = recode(Region,!!!regTOeng))
+
+tested_region <- left_join(tested,muncipal2reg,by = c("name" = "navn")) %>%
+  left_join(REGpop,by = "Region") %>%
+  count(Region,popsize,date,wt = value,name = "value")
+```
+
+## Sequencing coverage - by region
+
+```{r}
+# Percent with genome.----------------------------------------------------------
+genomes <- meta_wholeDK %>%
+  filter(date_week >= mindate & date_week <= maxdate) %>%
+  mutate(Type = ifelse(sequence_status == "genome","With genome","Without genome") %>% factor(.,levels = c("Without genome","With genome"))) 
+
+# By region.
+genomes_region <- genomes %>%
+  filter(!is.na(Region) & Region != "Grønland") %>%
+  count(Region,date_week,Type) %>%
+  mutate(Region = factor(Region,levels = names(regioner_col)))
+
+# Quantify the percentages.
+genomes_pct_period <- genomes_region %>%
+  pivot_wider(names_from = "Type",values_from = "n") %>%
+  mutate(pct = `With genome`/(`With genome` + `Without genome`)*100) 
+
+# Total pct through study.
+genomes_pct_period %>%
+  group_by(date_week) %>% 
+  summarise(across(starts_with("With"),~sum(.x))) %>%
+  mutate(pct = `With genome`/(`With genome` + `Without genome`)*100) %>%
+  ggplot(aes(x = date_week,y = pct)) + geom_line()
+
+# By region.
+genomes_pct_period  %>%
+  group_by(Region) %>%
+  summarise(m = mean(pct),lwr = min(pct),upr = max(pct),sd = sqrt(var(pct)),IQR = IQR(pct))
+
+# Plot.
+p_seq_reg <- ggplot(genomes_region,aes(x = date_week+3.5,y = n,fill = Type)) + 
+  facet_wrap(facets = vars(Region),ncol = 1,scales = "free_y") + 
+  geom_text(aes(label = Region),x = min(genomes_region$date_week)+2,y = Inf,hjust = 0,vjust = 2,check_overlap = T,size = 2.5) +
+  geom_col() +
+  scale_fill_manual(breaks = "With genome",labels = "Has genome",values = c("#8d96a3","#00A087FF")) +
+  # Add grey areas.
+  annotate("rect",xmin = min(genomes_region$date_week)-1,xmax = min(c(dates_import,dates_model)),ymin = 0,ymax = Inf,alpha = .1) +
+  annotate("rect",xmin = max(c(dates_import,dates_model))+1,xmax = max(genomes_region$date_week)+8,ymin = 0,ymax = Inf,alpha = .1) +
+  # Add vertical lines.
+  geom_vline(xintercept = min(dates_model),linetype = "dashed",size = .2) +
+  geom_vline(xintercept = max(dates_model)+1,linetype = "dashed",size = .2) +
+  scale_x_date(expand = c(0,0),breaks = brk_mth$date,labels = brk_mth$nm) +
+  coord_cartesian(clip = "off",ylim = c(0.01,NA)) +
+  scale_y_continuous(expand = c(0,0,.2,0)) +
+  labs(
+    fill     = NULL,
+    x        = NULL,
+    y        = NULL) +
+  theme_bw(base_size = 8) +
+  theme(
+    panel.grid           = element_blank(),
+    strip.background     = element_blank(),
+    strip.text           = element_blank(), 
+    legend.position      = c(1,1),
+    legend.justification = c(1,1),
+    legend.text          = element_text(size = 6),
+    legend.key.size      = unit(.5,'lines'),
+    legend.background    = element_rect(fill = alpha("white",0)))
+
+p_seq_reg
+
+# Same data, but now relative to total case numbers.
+genomes_pct <- genomes_region %>%
+  pivot_wider(names_from = "Type",values_from = "n") %>%
+  mutate(pct = `With genome`/(`With genome` + `Without genome`)*100) %>%
+  mutate(date_week = date_week + 3.5)
+
+p_seq_reg_pct <- ggplot(genomes_pct,aes(x = date_week,y = pct,colour = Region,group = Region)) + 
+  geom_line() +
+  scale_colour_manual(values = regioner_col) +
+  scale_x_date(expand = c(0,0),breaks = brk_mth$date,labels = brk_mth$nm) +
+  scale_y_continuous(expand = c(0,0),limits = c(0,100),breaks = c(25,50,75,100)) +
+  # Add grey areas.
+  annotate("rect",xmin = min(genomes_pct$date_week)-5,xmax = min(c(dates_import,dates_model)),ymin = 0,ymax = Inf,alpha = .1) +
+  annotate("rect",xmin = max(c(dates_import,dates_model)),xmax = max(genomes_pct$date_week)+5,ymin = 0,ymax = Inf,alpha = .1) +
+  # Add vertical lines.
+  geom_vline(xintercept = min(dates_model),linetype = "dashed",size = .2) +
+  geom_vline(xintercept = max(dates_model),linetype = "dashed",size = .2) +
+  labs(x = NULL,y = "Genome coverage [%]",colour = NULL) +
+  theme_bw(base_size = 8) +
+  theme(
+    panel.grid = element_blank())
+```
+
+## Tested - by region
+
+```{r}
+# Create the weekly number of tested per 100,000 for each region.
+tested_region_week <- tested_region %>%
+  mutate(date_week = lubridate::floor_date(date,unit = "week",week_start = 1)) %>%
+  mutate(date_week = date_week + 3.5) %>%
+  group_by(Region,popsize,date_week) %>%
+  summarise(n = sum(value)) %>%
+  mutate(n_pct     = n/popsize*100) %>%
+  mutate(n_pr_100T = n/(popsize/100000)) %>%
+  ungroup() %>%
+  mutate(Region = factor(Region,levels = names(regioner_col)))
+
+# plot.
+p_tested <- ggplot(tested_region_week,aes(x = date_week,y = n_pr_100T,colour = Region)) +
+  geom_line() +
+  scale_colour_manual(values = regioner_col) +
+  scale_x_date(expand = c(0,0),breaks = brk_mth$date,labels = brk_mth$nm) +
+  scale_y_continuous(expand = c(0,0,.1,0),limits = c(0,NA)) +
+  # Add grey areas.
+  annotate("rect",xmin = min(tested_region_week$date_week)-5,xmax = min(c(dates_import,dates_model)),ymin = 0,ymax = Inf,alpha = .1) +
+  annotate("rect",xmin = max(c(dates_import,dates_model)),xmax = max(tested_region_week$date_week)+5,ymin = 0,ymax = Inf,alpha = .1) +
+  # Add vertical lines.
+  geom_vline(xintercept = min(dates_model),linetype = "dashed",size = .2) +
+  geom_vline(xintercept = max(dates_model),linetype = "dashed",size = .2) +
+  labs(x = NULL,y = "Tested Per 100,000",colour = NULL) +
+  theme_bw(base_size = 8) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = c(.4,.01),
+    legend.justification = c(1,0),
+    legend.key = element_rect(fill = "transparent"),
+    legend.key.size = unit(0.5,'lines'),
+    legend.text     = element_text(size = 6))
+
+p_tested
+
+# Create shared legend between sequencing rate and number of tested.
+leg <- get_legend(
+  p_seq_reg_pct + 
+  theme(
+    legend.position = "bottom",
+    legend.key.size = unit(0.5,'lines'),
+    legend.text     = element_text(size = 6)))
+
+# plot.
+p_testGenom <- plot_grid(
+  p_seq_reg_pct + theme(legend.position = "none",axis.text.x = element_blank()),
+  p_tested + theme(legend.position = "none"),
+  leg,
+  rel_heights = c(1,1,.2),
+  align       = "v",
+  axis        = "lr",
+  ncol        = 1,
+  label_x     = -.03,
+  labels      = c("(A)","(B)"))
+
+ggsave(p_testGenom,filename = "figures/tested-and-genome-coverage.png",width = 4,height = 5,dpi = 300,device = "png")
+```
+
+## Sequencing turnaround 
+
+```{r}
+# Calculate the turnaround time.
+turnaround <- meta_wholeDK %>%
+  filter(date_week >= mindate & date_week <= maxdate) %>%
+  filter(sequence_status == "genome" & !is.na(Region)) %>%
+  mutate(turnaround = as.numeric(date_sequencing - date_linelist)) %>%
+  select(Region,date_week,date_linelist,turnaround) 
+
+# mean +/- sd turnaround in the period from 2020-11-14 to 2021-01-04.
+filter(turnaround,date_linelist >= dates_import[1] & date_linelist <= dates_model[1]) %>%
+  pull(turnaround) %>% 
+  {c(mean(.),sd(.))}
+
+# mean +/- sd turnaround in the period 2021-01-04 to 2021-02-07.
+filter(turnaround,date_linelist >= dates_model[1] & date_linelist <= dates_model[2]) %>%
+  pull(turnaround) %>% 
+  {c(mean(.),sd(.))}
+
+# Calculate the median by week.
+turnaround_week <- turnaround %>%
+  group_by(date_week) %>%
+  summarise(med = median(turnaround)) 
+  
+# Plot the median turnaround for each week.
+ggplot(turnaround_week,aes(x = date_week+3.5,y = med)) + 
+  geom_line() +
+  scale_x_date(expand = c(0,0),breaks = brk_mth$date,labels = brk_mth$nm) +
+  scale_y_continuous(expand = c(0,0,.1,0),limits = c(0,NA)) +
+  # Add grey areas.
+  annotate("rect",xmin = min(genomes_pct$date_week)-5,xmax = min(c(dates_import,dates_model)),ymin = 0,ymax = Inf,alpha = .1) +
+  annotate("rect",xmin = max(c(dates_import,dates_model)),xmax = max(genomes_pct$date_week)+5,ymin = 0,ymax = Inf,alpha = .1) +
+  # Add vertical lines.
+  geom_vline(xintercept = min(dates_model),linetype = "dashed",size = .2) +
+  geom_vline(xintercept = max(dates_model),linetype = "dashed",size = .2) +
+  labs(x = NULL,y = "Turnaround [days]",colour = NULL) +
+  theme_bw(base_size = 8) +
+  theme(panel.grid = element_blank())
+```
+
+# Lineage abundance over time - by region
+
+```{r}
+rollspan <- 14 # span of rolling average, in days.
+
+linabund <- meta_wholeDK %>%
+  filter(sequence_status == "genome" & !is.na(Region) & Region != "Grønland") %>%
+  filter(date_linelist >= (mindate - (rollspan/2)) & date_linelist <= (maxdate + (rollspan/2)+1)) %>%
+  select(Region,date_week,date_linelist,lineage)
+
+# Extract 10 most abundant lineages.
+abund_lineages <- linabund %>%
+  group_by(date_week) %>%
+  count(lineage) %>%
+  mutate(pct = n/sum(n)*100) %>%
+  group_by(lineage) %>%
+  summarise(abundant = max(pct)) %>%
+  arrange(-abundant) %>%
+  head(10) %>%
+  pull(lineage)
+  
+# Group all other lineages in "Other lineages".
+linabund_all <- linabund %>%
+  mutate(abund_lineage = case_when(
+    lineage %in% abund_lineages ~ lineage,
+    is.na(lineage)              ~ "N/A",
+    TRUE                        ~ "Other lineages"  
+  )) %>%
+  filter(abund_lineage != "N/A")
+
+# Compute rolling averages.
+linabund_all_roll <- linabund_all %>%
+  group_by(date_linelist,Region) %>%
+  count(abund_lineage) %>%
+  ungroup() %>%
+  complete(date_linelist,Region,abund_lineage,fill = list(n = 0)) %>%
+  arrange(date_linelist,Region,abund_lineage) %>%
+  group_by(abund_lineage,Region) %>%
+  mutate(n_roll   = rollmean(n,k = rollspan,fill = NA)) %>%
+  group_by(date_linelist,Region) %>%
+  mutate(keep     = !all(is.na(n_roll))) %>%
+  filter(keep) %>%
+  mutate(pct_roll = n_roll/sum(n_roll)*100) %>%
+  filter(abund_lineage != "Other lineages")
+
+# Format the levels so B117 is first.
+lvl <- unique(linabund_all_roll$abund_lineage) %>%
+  {c("B.1.1.7",setdiff(.,"B.1.1.7"))} %>%
+  rev()
+
+linabund_all_roll <- linabund_all_roll %>%
+  ungroup() %>%
+  mutate(abund_lineage = factor(abund_lineage,levels = lvl)) %>%
+  arrange(abund_lineage) %>%
+  mutate(Region = factor(Region,levels = names(regioner_col)))
+
+# Define colours.
+cls <- rev(ggsci::pal_npg()(length(lvl))) %>%
+  `names<-`(lvl)
+
+# Get date where B117 crosses 50% relative abundance.
+cross50 <- filter(linabund_all_roll,abund_lineage == "B.1.1.7") %>%
+  mutate(close50 = abs(pct_roll - 50)) %>%
+  group_by(Region) %>%
+  slice_min(close50,n = 1)
+  
+# Plot.
+p_roll <- ggplot(linabund_all_roll,aes(x = date_linelist,y = pct_roll,fill = abund_lineage)) +
+  facet_wrap(facets = vars(Region),ncol = 1) +
+  geom_area() +
+  scale_fill_manual(values = cls) +
+  # Add grey areas.
+  annotate("rect",xmin = min(linabund_all_roll$date_linelist),xmax = min(c(dates_import,dates_model)),ymin = 0,ymax = 100,alpha = .1) +
+  annotate("rect",xmin = max(c(dates_import,dates_model)),xmax = max(linabund_all_roll$date_linelist),ymin = 0,ymax = 100,alpha = .1) +
+  # Add vertical lines.
+  geom_vline(xintercept = min(dates_model),linetype = "dashed",size = .2) +
+  geom_vline(xintercept = max(dates_model),linetype = "dashed",size = .2) +
+  # Add point and date at 50%.
+  geom_point(data = cross50,show.legend = F,size = .5) +
+  geom_text(data  = cross50,aes(label = date_linelist),x = as.Date("2021-02-08"),hjust = 0,vjust = 2,size = 2) +
+  coord_cartesian() +
+  scale_x_date(expand = c(0,0),breaks = brk_mth$date,labels = brk_mth$nm) +
+  scale_y_continuous(
+    expand   = c(0,0),
+    breaks   = NULL,
+    limits   = c(0,100),
+    sec.axis = sec_axis(~.,breaks = c(25,50,75,100),labels = paste0(c(25,50,75,100),"%"))) +
+  labs(x = NULL,y = NULL,fill = NULL) +
+  guides(
+    color = guide_legend(override.aes = list(size = .1)),
+    fill  = guide_legend(override.aes = list(size = .01),nrow = 2)) +
+  theme_bw(base_size = 8) +
+  theme(
+    legend.position = "none",
+    legend.text     = element_text(size = 6),
+    legend.key.size = unit(.5,'lines'),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    panel.grid      = element_blank()) 
+  
+p_roll
+```
+
+## Calculating transmissibility 
+
+```{r}
+# Reformat the data.
+gr_dat <- meta_wholeDK %>%
+  filter(!is.na(Region) & Region != "Grønland") %>%
+  filter(date_linelist >= mindate & date_linelist <= maxdate) %>%
+  mutate(type = ifelse(sequence_status == "genome",
+                    ifelse(is.na(lineage),"noGenome",ifelse(lineage == "B.1.1.7","B117","Other")),
+                    "noGenome")) %>%
+  group_by(date_linelist,Region) %>%
+  count(type,.drop = T) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = c("date_linelist","Region"),names_from = "type",values_from = "n",values_fill = 0) %>%
+  mutate(noPos    = B117+Other+noGenome) %>%
+  mutate(pct      = B117/(B117+Other)*100) %>%
+  mutate(days     = as.numeric(date_linelist - min(date_linelist))) %>%
+  mutate(days_fct = factor(days)) %>%
+  left_join(select(tested_region,Region,date,value),by = c("Region","date_linelist" = "date")) %>%
+  dplyr::rename(noTested = value) %>%
+  mutate(Region   = factor(Region,levels = names(regioner_col)))
+
+# Format to glmmTMB.
+gr_dat_poi <- filter(gr_dat,date_linelist >= dates_model[1] & date_linelist <= dates_model[2]) %>%
+  group_by(date_linelist,Region) %>%
+  pivot_longer(cols = c("B117","Other"),names_to = "type",values_to = "ntype") %>%
+  mutate(pSeq = 1 - noGenome/noPos) %>%
+  mutate(type = factor(type,levels = c("B117","Other"))) 
+
+# Final model used in manuscript.
+poi_final  <- glmmTMB(
+  formula = ntype ~ Region + days + type + Region:type + type:days + log(noTested) + offset(log(pSeq)) + ar1(days_fct+0|Region),
+  data    = gr_dat_poi,
+  family  = poisson)
+
+# Model with regional growth rates.
+poi_regtrans <- glmmTMB(
+  formula = ntype ~ Region + days + type + Region:type + type:days + Region:days + log(noTested) + offset(log(pSeq)) + ar1(days_fct+0|Region),
+  data    = gr_dat_poi,
+  family  = poisson)
+
+# Test if ok to remove regional growth rates --> it is.
+anova(poi_final,poi_regtrans) 
+
+# Model without AR1 autocorrelation.
+poi_noAR1  <- glmmTMB(
+  formula = ntype ~ Region + days + type + Region:type + type:days + log(noTested) + offset(log(pSeq)),
+  data    = gr_dat_poi,
+  family  = poisson)
+
+# Test if ok to remove AR1 autocorrelation --> it is not.
+anova(poi_final,poi_noAR1) 
+
+# Compare all models to each other.
+aictab(cand.set = list(final = poi_final,regtrans = poi_regtrans,noAR1 = poi_noAR1))
+
+# Calculate the transmissiblity.------------------------------------------------
+gtime <- 5.5 # Generation time.
+
+slopeID <- grep("days", names(fixef(poi_final)$cond))
+estDate <- poi_final$fit$par[slopeID]
+covDate <- poi_final$sdr$cov.fixed[slopeID, slopeID]
+comb <- cbind(1, c(0,1))
+estGr <- as.numeric(comb %*% estDate)
+estGrCov <- comb %*% covDate %*% t(comb)
+estGrSD <- sqrt(diag(estGrCov))
+GrNames <- levels(gr_dat_poi$type)
+
+GrCI <- estGr + cbind(Gr = 0, lower = -2*estGrSD, upper = 2*estGrSD)
+RtCI <- 1 + GrCI*gtime
+RtCI
+
+simGr <- mvrnorm(n=1e6, mu=estGr, Sigma = estGrCov)
+simRt <- 1 + simGr*gtime
+quantile(simRt[,2]/simRt[,1], probs = c(0.025, 0.25, 0.5, 0.75, 0.975))
+(1 + estGr[2]*gtime) / (1 + estGr[1]*gtime)
+
+# Make predictions.-------------------------------------------------------------
+tmp1 <- gr_dat %>%
+  group_by(date_linelist,Region) %>%
+  pivot_longer(cols = c("B117","Other"),names_to = "type",values_to = "ntype") %>%
+  mutate(pSeq = 1 - noGenome/noPos) %>%
+  mutate(type = factor(type,levels = c("B117","Other"))) %>%
+  ungroup() %>%
+  filter(type == "B117") %>%
+  dplyr::select(date_linelist,Region,type,days,noTested,pSeq,days_fct)
+ 
+tmp2 <- tmp1 %>%
+  predict(poi_final, newdata = .,allow.new.levels = TRUE, se.fit = TRUE, re.form=NA) %>%
+  data.frame() %>%
+  mutate(
+    y_pred = poisson()$linkinv(fit),
+    lwr    = poisson()$linkinv(fit - 1.96*se.fit),
+    upr    = poisson()$linkinv(fit + 1.96*se.fit))
+
+gr_dat_poi_pred <- bind_cols(tmp1,tmp2) %>%
+  mutate(Region = factor(Region,levels = names(regioner_col)))
+
+# Plot the counts and the predictions.------------------------------------------
+p_gr_count <- ggplot(gr_dat,aes(x = date_linelist)) +
+  facet_wrap(facets = vars(Region),ncol = 1,scales = "free_y") +
+  geom_text(aes(label = Region),x = min(gr_dat$date_linelist)+2,y = Inf,hjust = 0,vjust = 2,check_overlap = T,size = 2.5) +
+  #  Add model predictions.
+  geom_ribbon(data = gr_dat_poi_pred,mapping = aes(ymin = lwr,ymax = upr),fill = alpha("grey",alpha = 1),colour = "grey",size = .2) +
+  geom_line(data = gr_dat_poi_pred,mapping = aes(y = y_pred),size = .2) +
+  geom_point(aes(y = B117),size = .75,colour = cls["B.1.1.7"]) +
+  scale_x_date(breaks = brk_mth$date,labels = brk_mth$nm,expand = c(0,0)) +
+  coord_cartesian(xlim = c(min(gr_dat$date_linelist)-1,max(gr_dat$date_linelist)+1)) +
+  # Add grey areas.
+  annotate("rect",xmin = min(gr_dat$date_linelist)-1,xmax = min(c(dates_import,dates_model)),ymin = 0,ymax = Inf,alpha = .1) +
+  annotate("rect",xmin = max(c(dates_import,dates_model)),xmax = max(gr_dat$date_linelist)+1,ymin = -Inf,ymax = Inf,alpha = .1) +
+  # Add vertical lines.
+  geom_vline(xintercept = min(dates_model),linetype = "dashed",size = .2) +
+  geom_vline(xintercept = max(dates_model),linetype = "dashed",size = .2) +
+  labs(x = NULL,y = "Cases per day") +
+  theme_bw(base_size = 8) +
+  theme(
+    panel.grid       = element_blank(),
+    strip.background = element_blank(),
+    strip.text       = element_blank(),
+    legend.position  = "none")
+```
+
+Combine subfigures to make figure 1
+
+```{r}
+p_stats <- plot_grid(
+  p_seq_reg + 
+    theme(
+      panel.border     = element_rect(colour = "grey20", fill=NA, size=.1),
+      panel.spacing    = unit(.5,'lines'),
+      legend.spacing.x = unit(.1,'lines'),
+      legend.position = c(1.01,1.01),
+      strip.background = element_blank(),
+      strip.text       = element_blank(),
+      plot.margin      = margin(t = 30,r = .1,b = 5.5,l = 5.5)),
+  p_roll + 
+    theme(
+      legend.position  = "none",
+      panel.border     = element_rect(colour = "grey20", fill=NA, size=.2),
+      strip.background = element_blank(),
+      strip.text       = element_blank(), 
+      panel.spacing    = unit(.5,'lines'),
+      plot.margin      = margin(t = 30,r = 5.5,b = 5.5,l = 2)),
+  nrow       = 1,
+  align      = "h",
+  axis       = "tb",
+  labels     = c("(A) Number of positive cases","(B) Abundance of all lineages"),
+  hjust      = 0,
+  rel_widths = c(1,1),
+  label_x    = c(.14,.02),
+  label_size = 10)
+
+leg <- get_legend(p_roll + theme(legend.position = "bottom"))
+
+p <- plot_grid(p_stats,leg,rel_heights = c(1,.1),nrow = 2)
+
+ggsave(p,filename = "figures/fig1.png",device = "png",width = 5,height = 7,dpi = 300,scale = .99)
+```
+
+# Introductions 
+
+```{r}
+tree_pastml <- read.tree("../2021-04-18_analysis/pastml/by_nonDK/named.tree_out.date.nwk")
+
+# No internationals.
+filter(meta_intro,ID %in% tree_pastml$tip.label) %>%
+  filter(country != "Denmark") %>%
+  nrow()
+
+# For counting no. of DK descendants.
+whDK <- filter(meta_intro,country == "Denmark") %>% pull(ID)
+
+# Read the pajek network file into R.
+g_vert <- data.table::fread(
+  cmd       = "awk '/vert/{flag=1; next} /arcs/{flag=0} flag' ../2021-04-18_analysis/pastml/by_nonDK/B117_map.net",
+  col.names = c("id","root_node","nodes_in","state"),
+  sep       = " ") %>%
+  mutate(state = sub("nonDK_region:","",state)) %>%
+  mutate(nodes_in = strsplit(nodes_in,split = ",")) %>%
+  tibble()
+
+# Add the marginal probability for the ancestral state.
+prob_state <- read_tsv("../2021-04-18_analysis/pastml/by_nonDK/marginal_probabilities.character_nonDK_region.model_F81.tab") %>%
+  pivot_longer(-one_of("node"),names_to = "state",values_to = "probability") %>%
+  dplyr::rename(root_node = node) %>%
+  right_join(
+    dplyr::select(g_vert,root_node,state),by = c("root_node","state"))
+
+g_vert <- left_join(g_vert,prob_state,by = c("root_node","state"))
+
+# Resolve ambigous states. notDK takes precedence.
+g_vert <- mutate(g_vert,
+  state = strsplit(state,split = " or ") %>%
+    sapply(function(i){
+      ifelse(length(i) > 1,
+        ifelse(any(i == "notDK"),"notDK","Denmark"),i)
+    }))
+
+# Need to be sure that no non-DK sequences are in the DK clusters.
+g_vert <- g_vert %>%
+  mutate(nodes_in = ifelse(sapply(nodes_in,length) > 0 & state != "notDK",
+    map(nodes_in,~intersect(.x,filter(meta_intro,country == "Denmark") %>% pull(ID))),
+    nodes_in))
+
+# summary stats of each cluster.
+clst_stat <- dplyr::select(g_vert,id,state,nodes_in) %>% 
+  unnest(cols = nodes_in) %>%
+  left_join(meta_intro,by = c("nodes_in" = "ID")) %>%
+  group_by(id,state) %>%
+  summarise(
+    idx_case    = nodes_in[which.min(date)],
+    first_occur = min(date),
+    days        = as.numeric(max(date) - min(date)),
+    first_week  = sort(date_week_iso)[1],
+    last_week   = sort(date_week_iso,decreasing = T)[1],
+    no_desc     = n())
+
+g_vert <- left_join(g_vert,clst_stat,by = c("id","state")) %>%
+  mutate(no_desc = ifelse(is.na(no_desc),0,no_desc))
+
+# Split out the bootstrap support.
+g_vert <- g_vert %>%
+  mutate(suport = ifelse(root_node != "root" & no_desc > 1,sub("-.*","",x = root_node),NA))
+    
+# Load the links in the network.
+g_edges  <- data.table::fread(
+  cmd       = "awk 'BEGIN {flag=0} /arcs/ {flag=1; next} flag' ../2021-04-18_analysis/pastml/by_nonDK/B117_map.net",
+  col.names = c("from","to"),
+  sep       = " ") %>%
+  tibble()
+
+# Make a nested naming structure.
+tmp1 <- data.tree::FromDataFrameNetwork(g_edges) %>%
+  data.tree::ToDataFrameTypeCol("pathString") %>%
+  pull(pathString) %>%
+  gsub("/","-",x = .)
+
+tmp2 <- tmp1 %>%
+  sapply(function(i){
+    vec <- strsplit(i,split = "-")[[1]]
+    sapply(-seq_len(length(vec)-1),head,x = vec) %>% sapply(paste,collapse = "-")
+  }) %>%
+  unlist() %>%
+  unique()
+
+lin_name <- union(tmp1,tmp2) %>%
+  gsub("^1-","",x = .) %>%
+  data.frame(lineage_name = .,stringsAsFactors = F) %>%
+  as_tibble() %>%
+  mutate(id = sapply(lineage_name,strsplit,split = "-") %>% sapply(tail,n = 1) %>% as.numeric())
+
+g_vert <- left_join(g_vert,lin_name,by = "id")
+
+# Map names of region to english.
+g_vert <- g_vert %>%
+  mutate(state = recode(state,!!!regTOeng)) %>%
+  mutate(state = recode(state,Sjaelland = "Zealand"))
+
+grph_v1 <- tbl_graph(nodes = g_vert,edges = g_edges,directed = T)
+```
+
+## Number of introductions across time
+
+```{r}
+# find parent states.
+x1 <- g_vert %>% dplyr::rename(parent_state = state) %>% dplyr::select(id,parent_state)
+x2 <- g_vert %>% dplyr::select(id,lineage_name,state,first_occur,nodes_in,idx_case)
+
+parent_states <- left_join(g_edges,x1,by = c("from" = "id")) %>%
+  left_join(x2,by = c("to" = "id")) %>%
+  select(-from) %>%
+  dplyr::rename(id = to) %>%
+  mutate(no_steps = as.numeric(shortest.paths(grph_v1,v = 1,to = id)))
+  
+parent_states_DK <- parent_states %>% 
+  filter(state != "notDK") %>%
+  arrange(no_steps)
+
+# Make sure we only factor in those clusters in DK.
+DK_clusters <- pull(parent_states_DK,id)
+
+# Walk the network from root to tip, and collapse into introduction lineages.
+out_lst <- list()
+while(nrow(parent_states_DK) > 0){
+  wh_node    <- parent_states_DK$id[1]
+  wh_lineage <- parent_states_DK$lineage_name[1]
+  wh_state   <- parent_states_DK$state[1]
+  wh_case    <- parent_states_DK$idx_case[1]
+  
+  collapse_nodes <- neighborhood(grph_v1,order = 10,nodes = wh_node,mode = "out")[[1]] %>% 
+    as.vector() %>%
+    intersect(.,DK_clusters)
+  
+  to_add <- filter(parent_states_DK,id %in% collapse_nodes) %>%
+    summarise(
+      id           = wh_node,
+      lineage_name = wh_lineage,
+      state        = wh_state,
+      no_desc      = sapply(nodes_in,length) %>% sum(),
+      nodes_in     = list(filter(g_vert,id %in% collapse_nodes) %>% pull(nodes_in) %>% unlist()),
+      first_occur  = min(first_occur,na.rm = T),
+      idx_case     = idx_case[which.min(first_occur)])
+  
+  out_lst <- c(out_lst,list(to_add))
+  
+  parent_states_DK <- filter(parent_states_DK,!id %in% collapse_nodes)
+  print(nrow(parent_states_DK))
+}
+
+# Convert to a data.frame.
+intros <- bind_rows(out_lst) %>%
+  mutate(date_week_iso = ISOweek(first_occur) %>% factor(levels = c(paste0("2020-W",46:53),paste0("2021-W0",1:5)))) %>%
+  mutate(date_week     = lubridate::floor_date(first_occur,unit = "week",week_start = 1)) %>%
+  mutate(sizes         = cut(no_desc,breaks = c(0,1.5,5.5,100.5,Inf),labels = c("1","2-5","6-100",">100"))) %>%
+  mutate(sizes         = factor(sizes,levels = c("1","2-5","6-100",">100"))) %>%
+  group_by(date_week) %>%
+  arrange(desc(sizes),state) %>%
+  mutate(n = 1:n()) 
+
+################################################################################
+# Make a naming scheme.
+reglinNM <- setNames(
+  nm     = c(regTOeng,"Denmark"),
+  object = c("ND","CD","SD","ZL","CA","DK"))
+
+intros <- intros %>% 
+  arrange(state,first_occur) %>%
+  group_by(state) %>%
+  mutate(reglin_name = paste0(recode(state,!!!reglinNM),row_number()))
+################################################################################
+
+# total number of introductions.
+ungroup(intros) %>% count(sizes) %>% mutate(pct = n/sum(n))
+ungroup(intros) %>% pull(no_desc) %>% table()
+
+# Lookup households.
+addr <- filter(intros,sizes == "2-5") %>%
+  ungroup() %>%
+  select(reglin_name,nodes_in) %>%
+  unnest(cols = nodes_in) %>%
+  left_join(meta_intro %>% select(ID_old,ID),by = c("nodes_in" = "ID")) %>%
+  left_join(ssiTOcpr,by = "ID_old") %>%
+  left_join(meta_wholeDK %>% select(CPR,Address)) %>%
+  filter(!is.na(Address)) %>%
+  select(reglin_name,Address) 
+  
+addr %>% 
+  group_by(reglin_name) %>%
+  summarise(n_address = length(unique(Address))) %>%
+  count(n_address)
+  
+# plot
+p_intro_simple <- ggplot(intros,aes(x = date_week+3.5,fill = sizes)) + 
+  geom_bar(width = 6) +
+  scale_fill_manual(values =  ggsci::pal_npg()(10)[c(2,6,4,8)]) + #ggsci::pal_npg()(6)[c(2,3,5,6)]) +
+  scale_x_date(breaks = brk1week_whole,date_labels = "%b %d",expand = expansion(add = c(1,1))) +
+  scale_y_continuous(breaks = seq(5,100,5),expand = c(0,0,.1,0)) +
+  labs(x = NULL,y = "Introductions\ninto DK",fill = "Introduction lineage size") +
+  guides(fill = guide_legend(title.position = "top")) +
+  theme_bw(base_size = 8) +
+  theme(
+    legend.position      = c(0,.99),
+    legend.justification = c(0,1),
+    legend.direction     = "horizontal",
+    legend.key.size      = unit(.5,'lines'),
+    legend.title         = element_text(size = 6),  
+    legend.text          = element_text(size = 6),  
+    legend.background    = element_rect(fill = alpha('white',0)), 
+    axis.text.x          = element_text(angle = 90,vjust = .5),
+    panel.grid           = element_blank())
+
+# Update the nameing scheme according to introductions 
+# (OBS: we are only renaming those that are in DK. if a lineage is exported outside DK the name is not changed).
+g_vert <- g_vert %>%
+  mutate(lst = strsplit(lineage_name,split = "-")) %>%
+  mutate(reglin_name = mapply(function(nmstr,state){
+    if (state != "notDK"){
+      x1 <- intersect(nmstr,intros$id)
+      x2 <- filter(intros,id == x1) %>% pull(reglin_name)
+    
+      # Make the name.
+      if (which(nmstr == x1) == length(nmstr)){
+        x2
+      } else {
+        c(x2,nmstr[(which(nmstr == x1)+1):length(nmstr)]) %>% paste(collapse = "-")
+      }
+    } else {
+      paste(nmstr,collapse = "-")
+    }  
+  },nmstr = lst,state = state,SIMPLIFY = T)) %>%
+  select(-lst)
+
+# Make an updated graph with names.
+grph <- tbl_graph(nodes = g_vert,edges = g_edges,directed = T)
+```
+
+# Visualize the timetree used in figure 2
+
+```{r}
+wh <- intersect(tree_pastml$tip.label,meta_intro$ID)
+
+# Tidy metadata to the tree.
+meta_intro_tree <- dplyr::filter(meta_intro,ID %in% wh) %>%
+  mutate(Region = factor(Region,levels = names(regioner_col))) %>%
+  mutate(idx_case = ifelse(ID %in% intros$idx_case,"First case of\nintroduction lineage",NA))
+
+treemeta_intro <- ggtree(tree_pastml,
+  as.Date = T,
+  mrsd    = max(meta_intro_tree$date),
+  colour  = "gray90",
+  size    = .2) %<+% meta_intro_tree
+
+# Which node in tree that is root of the CA1 lineage.
+wh_node <- as_tibble(tree_pastml) %>%
+  filter(label == "50-2407.polytomy_0") %>%
+  pull(node)
+
+# plot.
+p_tree <- treemeta_intro + theme_tree2() + 
+  geom_tippoint(size = .2,colour = "grey") +
+  geom_tippoint(aes(colour = Region),size = .75) +
+  scale_colour_manual(values = regioner_col,na.translate = F) +
+  geom_tippoint(aes(shape = idx_case),size = 1) +
+  scale_shape_manual(values = 21,na.translate = F) +
+  geom_cladelabel(node = wh_node,label = "CA1",offset = -370,offset.text = -185,align = T,fontsize = 3) +
+  scale_x_date(breaks = brk_mth$date,labels = brk_mth$nm,expand = c(0,0,.1,0)) +
+  labs(colour = "",shape = "") +
+  theme(
+    legend.position      = c(0.05,.95),
+    legend.justification = c(0,1),
+    legend.key.size      = unit(.5,'lines'),
+    legend.title         = element_text(size = 6),  
+    legend.text          = element_text(size = 6),  
+    axis.text            = element_text(size = 6.4),
+    legend.spacing.y     = unit(-.2,"cm"),
+    legend.background    = element_rect(fill = alpha("white",0)))
+
+p_tree
+```
+
+# dotplot of transmission clusters over time
+
+```{r}
+# Create a long data.frame with all cases in the network.
+tran_clst <- select(g_vert,id,reglin_name,state,nodes_in,probability) %>% 
+  unnest(cols = nodes_in) %>%
+  left_join(meta_intro,by = c("nodes_in" = "ID")) %>%
+  filter(country == "Denmark" & state != "notDK") %>%
+  filter(state != "Denmark") %>%
+  mutate(date_week = ISOweek(date) %>% factor(levels = c(paste0("2020-W",46:53),paste0("2021-W0",1:5)))) %>%
+  mutate(Region = factor(Region,levels = names(regioner_col))) %>%
+  mutate(state  = factor(state,levels = names(regioner_col))) %>%
+  left_join(select(travel,ID_old,travel,country_to),by = "ID_old") %>%
+  group_by(id) %>%
+  mutate(idx_date = min(date)) %>%
+  mutate(duration = max(date) - idx_date) %>%
+  ungroup()
+
+# Identify the parent state.
+x1 <- g_vert %>% dplyr::rename(parent_state = state) %>% select(id,parent_state)
+x2 <- g_vert %>% select(id)
+
+tran_clst_parent <- left_join(g_edges,x1,by = c("from" = "id")) %>%
+  left_join(x2,by = c("to" = "id")) %>%
+  select(-from) %>%
+  dplyr::rename(id = to) 
+
+tran_clst <- left_join(tran_clst,tran_clst_parent,by = "id")
+
+# Summarize by week.
+tran_clst_byweek <- tran_clst %>%
+  filter(!is.na(country)) %>%
+  group_by(reglin_name,state,parent_state,probability,date_week) %>%
+  summarise(n = n(),AnyTravel = ifelse(any(travel == "Yes"),"Yes","No")) %>%
+  group_by(reglin_name,state,parent_state,probability) %>%
+  mutate(
+    first_week     = levels(droplevels(date_week))[1] %>% factor(levels = levels(date_week)),
+    last_week      = levels(droplevels(date_week)) %>% {.[length(.)]} %>% factor(levels = levels(date_week)),
+    duration_weeks = as.vector(dist(range(as.numeric(date_week)))) + 1) %>%
+  mutate(
+    date_week_date  = ISOweek2date(paste0(date_week,"-1")),
+    first_week_date = ISOweek2date(paste0(first_week,"-1")),
+    last_week_date  = ISOweek2date(paste0(last_week,"-1")))
+
+# Re-arrange ids for pretty plotting.
+lvl_id <- ungroup(tran_clst_byweek) %>%
+  select(reglin_name,first_week,duration_weeks,state) %>% 
+  unique() %>%
+  arrange(state,first_week,duration_weeks) %>%
+  pull(reglin_name)
+  
+tran_clst_byweek <- tran_clst_byweek %>%
+  mutate(reglin_name = factor(reglin_name,levels = lvl_id)) %>%
+  arrange(reglin_name)
+
+# y-axis labels.
+yaxis_labs <- ungroup(tran_clst_byweek) %>%
+  select(state,reglin_name) %>%
+  unique() %>%
+  mutate(reglin_name2 = as.character(reglin_name) %>% sapply(strsplit,split = "-") %>% sapply(head,n = 1)) %>%
+  arrange(reglin_name) %>%
+  mutate(pos = ifelse(row_number() %% 2 == 0,0,-.9)) 
+
+# Horizontal lines.
+h_lines <- ungroup(tran_clst_byweek) %>%
+  select(reglin_name,state,first_week_date,last_week_date) %>%
+  unique() %>%
+  arrange(reglin_name) 
+
+# Points if any travel.
+pt_travel <- ungroup(tran_clst_byweek) %>%
+  filter(AnyTravel == "Yes") %>%
+  select(reglin_name,date_week_date,state) %>%
+  unique() 
+  
+# Points if from outside DK.
+pt_outsideDK <- ungroup(tran_clst_byweek) %>%
+  filter(parent_state == "notDK") %>%
+  select(reglin_name,first_week_date,state) %>%
+  unique() 
+
+p_lineages_travel <- ggplot(tran_clst_byweek,aes(x = date_week_date+3.5,y = reglin_name,size = n)) + 
+  facet_grid(rows = vars(state),scales = "free_y",space = "free_y") +
+  geom_text(aes(label = state),x = mean(range(tran_clst_byweek$date_week_date))+3.5,y = Inf,vjust = 1.5,check_overlap = T,size = 2.5) +
+  geom_segment(
+    inherit.aes = F,
+    data        = h_lines,
+    mapping     = aes(x = first_week_date+3.5,xend = last_week_date+3.5,y = reglin_name,yend = reglin_name),
+    colour      = "darkgrey") +
+  geom_point(colour = "darkgrey") +
+  # Mark travels.
+  geom_point(
+    inherit.aes = F,
+    data        = pt_travel,
+    mapping     = aes(x = date_week_date+3.5,y = reglin_name,colour = "Any travel"),
+    size        = 1.2) +
+  scale_colour_manual(values = c("Any travel" = "#d1495b")) +
+  # Mark introductions.
+  geom_point(
+    inherit.aes = F,
+    data        = pt_outsideDK,
+    mapping     = aes(x = first_week_date+3.5,y = reglin_name,shape = "First case of\nintroduction lineage"),
+    size        = 1.2) +
+  scale_size(trans = "sqrt",breaks = c(1,5,50),range = c(.4,2.5)) +
+  scale_shape_manual(values = c("First case of\nintroduction lineage" = 21)) + 
+  scale_x_date(breaks = brk1week_whole,date_labels = "%b %d",expand = expansion(add = c(3.5,3.5))) +
+  scale_y_discrete(expand = expansion(add = 2)) +
+  labs(
+    x      = NULL,
+    y      = "Transmission cluster",
+    size   = "      No. cases",
+    shape  = NULL,
+    colour = NULL) +
+  guides(
+    size   = guide_legend(order = 1),
+    shape  = guide_legend(order = 2),
+    colour = guide_legend(order = 3)) +
+  theme_bw(base_size = 8) +
+  theme(
+    panel.spacing        = unit(.1,'lines'),
+    axis.text.x          = element_text(angle = 90,vjust = .5),
+    axis.ticks.y         = element_blank(), 
+    axis.text.y          = element_blank(),
+    panel.grid           = element_blank(),
+    strip.background     = element_blank(),
+    strip.text           = element_blank(),
+    legend.title         = element_text(size = 6),
+    legend.text          = element_text(size = 6),  
+    legend.spacing.y     = unit(0, "pt"),
+    legend.margin        = margin(0, 0, 0, 0),
+    legend.background    = element_rect(fill = alpha('white',0)),
+    legend.direction     = "horizontal",
+    legend.position      = c(.005,.38),
+    legend.justification = c(0,1),
+    legend.box.just      = "left")
+
+p_lineages_travel
+```
+
+# Superspreading events investigation
+
+```{r}
+# Group by week and haplotype.
+tmp <- meta_wholeDK %>%
+  filter(!is.na(Region)) %>%
+  filter(date_linelist >= mindate & date_linelist <= maxdate & lineage == "B.1.1.7") %>%
+  select(date_linelist,date_week,Region,nt_mutations) %>%
+  unite(nt_mutations,Region,col = "grp",remove = F) %>%
+  group_by(grp) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+# rename haplotypes.
+haplos <- tmp %>%
+  select(grp) %>%
+  unique() %>%
+  mutate(haplo = paste0("H",1:n())) 
+
+# Subset to only most abundant haplotypes.
+tmp2 <- left_join(tmp,haplos,by = "grp") %>%
+  select(-grp) %>%
+  group_by(haplo) %>%
+  mutate(start_date = min(date_linelist),
+         size       = n(),
+         weekly_max = max(table(date_week))) %>%
+  arrange(start_date,size) %>%
+  ungroup() %>%
+  nest_by(Region,haplo) %>%
+  group_by(Region,haplo) %>%
+  mutate(ord = sapply(data,function(i){unique(i$weekly_max)})) %>%
+  arrange(Region,-ord) %>%
+  group_by(Region) %>%
+  slice_head(n = 50) %>%
+  unnest(cols = c(data)) %>%
+  ungroup() %>%
+  mutate(Region = factor(Region,levels = names(regioner_col)))
+
+# make sure the data contains zeros for missing values.
+tmp3 <- tmp2 %>%
+  count(Region,haplo,date_week) %>%
+  complete(nesting(haplo,Region),date_week,fill = list(n = 0)) %>%
+  group_by(haplo) %>%
+  arrange(haplo,desc(date_week)) %>%
+  mutate(csum1 = cumsum(lead(n,default = 0))) %>%
+  arrange(haplo,date_week) %>%
+  mutate(csum2 = cumsum(lead(n,default = 0))) %>%
+  filter(csum1 > 0 & csum2 > 0)
+
+# Highlight the haplotypes referenced in the paper.
+wh_superspread <- group_by(tmp3,haplo) %>%
+  filter(any(n > 75) | haplo == "H77") %>%
+  arrange(Region) %>%
+  mutate(haplo = factor(haplo,levels = c("H77","H17","H87","H43")))
+  
+# Plot
+p_haplotypes <- ggplot(tmp3,aes(x = date_week+3.5,y = n,group = haplo)) + 
+  facet_grid(rows = vars(Region),scales = "free_y") +
+  geom_line(size = .2,colour = "grey") +
+  geom_line(data = wh_superspread,aes(colour = haplo)) +
+  ggsci::scale_color_npg() +
+  labs(x = NULL,y = "Cases per week",colour = "Haplotype") +
+  # Add grey areas.
+  annotate("rect",xmin = mindate,xmax = min(c(dates_import,dates_model)),ymin = 0,ymax = Inf,alpha = .1) +
+  annotate("rect",xmin = max(c(dates_import,dates_model)),xmax = maxdate,ymin = 0,ymax = Inf,alpha = .1) +
+  # Add vertical lines.
+  geom_vline(xintercept = min(dates_model),linetype = "dashed",size = .2) +
+  geom_vline(xintercept = max(dates_model),linetype = "dashed",size = .2) +
+  scale_x_date(breaks = brk_mth$date,labels = brk_mth$nm,expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0,.1,0)) +
+  theme_bw(base_size = 8) +
+    theme(
+      legend.position = "bottom",
+      strip.background = element_blank(),
+      strip.text = element_blank(),
+      panel.grid    = element_blank(),
+      panel.spacing = unit(.1,'lines'))
+
+p_countHaplo <- plot_grid(
+  p_gr_count + theme(plot.margin = margin(t = 20,r = 5.5,b = 5.5,l = 5.5)),
+  p_haplotypes + theme(plot.margin = margin(t = 20,r = 5.5,b = 5.5,l = 5.5)),
+  nrow = 1,
+  align = "h",axis = "tb",labels = c("(A)","(B)"),label_size = 10)
+
+ggsave(p_countHaplo,filename = "figures/count-haplo.png",width = 6,height = 7,dpi = 300,dev = "png")
+```
+
+# Transmission between regions
+
+```{r}
+# Make data.frame for showing distribution of transmission between regions.
+tmp <- ungroup(tran_clst_byweek) %>%
+  select(reglin_name,state,parent_state,first_week) %>%
+  mutate(introduction = ifelse(parent_state == "notDK","Outside DK","Other region")) %>%
+  mutate(parent_state = factor(parent_state,levels = rev(c("notDK","Denmark",rev(names(regioner_col)))))) %>%
+  unique() %>%
+  mutate(week_date = ISOweek2date(paste0(first_week,"-1")))
+
+# plot.
+p_introByWeekAndRegion <- ggplot(tmp,aes(x = week_date+3.5,fill = parent_state)) + 
+  facet_wrap(facets = vars(state),ncol = 1) + 
+  geom_bar(width = 6.3) +
+  geom_text(aes(label = state),x = mean(range(tmp$week_date))+3.5,y = Inf,vjust = 1.5,check_overlap = T,size = 2.5) +
+  scale_x_date(breaks = brk1week_whole,date_labels = "%b %d",expand = expansion(add = c(1,1))) +
+  scale_y_continuous(expand = c(0,0,.1,0),breaks = c(5,10,15,20)) +
+  labs(x = NULL,y = "Introductions per week",fill = "Introduced from") +
+  scale_fill_manual(values = c("Denmark" = "darkgrey","notDK" = "gray40",regioner_col)) +
+  guides(fill = guide_legend(title.position = "top",nrow = 3)) +
+  theme_bw(base_size = 8) +
+  theme(
+    panel.spacing        = unit(.1,'lines'),
+    legend.position      = c(0,1),
+    legend.justification = c(0,.99),
+    legend.key.size      = unit(.5,'lines'),
+    legend.spacing.x     = unit(.3,'lines'),
+    legend.title         = element_text(size = 6), 
+    legend.text          = element_text(size = 6),  
+    legend.background    = element_rect(fill = alpha('white',0)), 
+    panel.grid           = element_blank(),
+    strip.background     = element_blank(),
+    strip.text           = element_blank(), 
+    axis.text.x          = element_text(angle = 90,vjust = .5))
+```
+
+Then quantify the number of casses associated with vs without an introduction.
+
+```{r}
+cutoffs <- c(0,7,14,21)
+
+tmp <- tran_clst %>%
+  mutate(intro_lin = gsub("-.*","",reglin_name)) %>%
+  group_by(intro_lin) %>%
+  mutate(DaysAfterIntro = as.numeric(date - min(date))) %>%
+  ungroup() %>%
+  nest(data = everything()) %>%
+  tidyr::expand(data,DayUntil = cutoffs) %>%
+  mutate(subdat = map2(data,DayUntil,
+    ~.x %>%
+      mutate(isIntro = ifelse(DaysAfterIntro <= .y,"Yes","No")) %>%
+      select(date_week,isIntro))) %>%
+  select(-data) %>%
+  unnest(cols = c(subdat)) %>%
+  count(DayUntil,date_week,isIntro) %>%
+  pivot_wider(id_cols = c("DayUntil","date_week"),names_from = "isIntro",values_from = "n",values_fill = 0) %>%
+  mutate(pct_intro = Yes/(No+Yes)*100) %>%
+  mutate(DayUntil = factor(DayUntil,levels = cutoffs)) %>%
+  mutate(week_date = ISOweek2date(paste0(date_week,"-1"))) %>%
+  mutate(pct_intro = case_when(
+    DayUntil == "0"  ~ pct_intro,
+    DayUntil == "7"  ~ pct_intro+1,
+    DayUntil == "14" ~ pct_intro+2,
+    DayUntil == "21" ~ pct_intro+3)) %>%
+  mutate(pct_intro = ifelse(pct_intro > 100,100,pct_intro))
+
+p_NoCasesAssocIntro <- ggplot(tmp,aes(x = week_date+3.5,y = pct_intro,colour = factor(DayUntil),group = DayUntil)) +
+  geom_line() +
+  scale_colour_manual(labels = paste0(ifelse(cutoffs == 0,"=","<="),cutoffs),values = ggsci::pal_npg()(6)[c(2,3,5,6)]) +
+  scale_x_date(breaks = brk1week_whole,date_labels = "%b %d",expand = expansion(add = c(3.5,3.5))) +
+  scale_y_continuous(breaks = c(25,50,75,100),labels = paste0(c(25,50,75,100),"%"),expand = c(0,0,.01,0)) +
+  labs(x = NULL,y = "Cases associated\nwith introduction",colour = "Days since introduction") +
+  guides(colour = guide_legend(title.position = "top")) +
+  theme_bw(base_size = 8) +
+  theme(
+    legend.position      = c(0.99,.99),
+    legend.justification = c(1,1),
+    legend.direction     = "horizontal",
+    legend.key.size      = unit(.5,'lines'),
+    legend.title         = element_text(size = 6),
+    legend.text          = element_text(size = 6),  
+    legend.background    = element_rect(fill = alpha('white',0)), 
+    panel.grid           = element_blank(),
+    axis.text.x          = element_text(angle = 90,vjust = .5))
+```
+
+Combine into figure 3
+
+```{r}
+p1 <- plot_grid(
+  p_intro_simple +
+    theme(axis.text.x = element_blank()),
+  p_NoCasesAssocIntro +
+    theme(axis.text.x = element_blank()),
+  p_introByWeekAndRegion,
+  ncol        = 1,
+  rel_heights = c(.3,.3,1),
+  labels      = c("(B)","(C)","(D)"),
+  label_size = 10,
+  label_x = -.01,
+  label_y = c(1.01,1.01,1.005),
+  align = "v",
+  axis = "lr")
+
+p <- plot_grid(
+  p_lineages_travel + theme(plot.margin = margin(t = 5.5,r = 8,b = 3.5,l = 5.5)),
+  p1,
+  nrow   = 1,
+  labels = c("(A)",NULL),
+  label_x = -.03,
+  label_y = 1.001,
+  label_size = 10)
+
+ggsave(p,filename = "figures/fig3.png",width = 6,height = 7)
+```
+
+## Example case - CA1
+
+beadplot 
+
+```{r}
+# Get the nodes and layout as graph.
+wh_id <- 107
+wh    <- neighborhood(grph,nodes = wh_id,order = 10,mode = "out")
+
+grph_case <- induced_subgraph(grph,unlist(wh)) %>% 
+  as_tbl_graph() 
+
+grph_case_sub <- grph_case %N>%
+  filter(no_desc > 5)
+
+wh_nodes <- grph_case_sub %N>%
+  data.frame() %>%
+  select(id,reglin_name,suport)
+
+# Subset the lineage df.
+df_lineage_107 <- filter(tran_clst_byweek,reglin_name %in% wh_nodes$reglin_name) %>%
+  left_join(wh_nodes,by = "reglin_name") %>%
+  mutate(reglin_name = factor(reglin_name,levels = rev(wh_nodes$reglin_name))) %>%
+  arrange(reglin_name) 
+
+# Horizontal lines.
+h_lines <- ungroup(df_lineage_107) %>%
+  select(reglin_name,state,first_week_date,last_week_date) %>%
+  unique() 
+
+# Vertical arrows.
+idxTOid <- grph_case_sub %N>%
+  data.frame() %>% 
+  mutate(idx = 1:n()) %>%
+  select(idx,reglin_name) %>%
+  {setNames(.$reglin_name,.$idx)}
+
+idTOweek <- df_lineage_107 %>%
+  ungroup() %>%
+  select(reglin_name,first_week_date,probability) %>%
+  mutate(reglin_name = as.character(reglin_name)) %>%
+  unique()
+  
+v_lines <- grph_case_sub %E>%
+  as_tibble() %>%
+  mutate(from = invoke(recode,from,.x = idxTOid)) %>%
+  mutate(to   = invoke(recode,to,.x = idxTOid)) %>%
+  mutate_all(.funs = as.character) %>%
+  left_join(idTOweek,by = c("to" = "reglin_name")) 
+
+# Alternative y-text.
+ytext <- df_lineage_107 %>%
+  group_by(reglin_name) %>%
+  summarise(no_desc = sum(n)) %>%
+  mutate(txt = paste0(reglin_name," (n = ",no_desc,")"))
+
+# Plot
+p_case_time <- ggplot(df_lineage_107,aes(x = date_week_date+3.5,y = reglin_name,size = n,colour = state)) + 
+  geom_segment(
+    inherit.aes = F,
+    data        = h_lines,
+    mapping     = aes(x = first_week_date+3.5,xend = last_week_date+3.5,y = reglin_name,yend = reglin_name,colour = state)) +
+  geom_point() +
+  scale_size(trans = "sqrt",breaks = c(1,5,20),range = c(.4,4)) +
+  scale_colour_manual(values = regioner_col) +
+  geom_curve(
+    inherit.aes = F,
+    data        = v_lines,
+    mapping     = aes(x = first_week_date+3.5,xend =first_week_date+3.5,y = from,yend = to),
+    arrow       = arrow(length = unit(.5,'lines')),
+    curvature   = .2,
+    size        = .2) +
+  geom_text(
+    inherit.aes = F,
+    data        = idTOweek,
+    mapping     = aes(x = first_week_date+3.5,y = reglin_name,label = paste0(round(probability*100),"%")),
+    vjust       = 2,
+    hjust       = 0,
+    size        = 2) +
+  scale_x_date(breaks = brk1week_whole,date_labels = "%b %d",expand = expansion(add = c(3.5,3.5))) +
+  scale_y_discrete(
+    breaks = ytext$reglin_name,
+    labels = ytext$txt,
+    expand = expansion(add = c(.5,1.5))) +
+  labs(x = "",y = "Transmission cluster",size = "No. cases") +
+  guides(colour = FALSE,size = guide_legend(title.position = "left")) +
+  theme_bw(base_size = 8) +
+  theme(
+    panel.grid           = element_blank(),
+    legend.key.size      = unit(.5,'lines'),
+    legend.title         = element_text(size = 6),  
+    legend.text          = element_text(size = 6),  
+    legend.background    = element_rect(fill = alpha('white',0)), 
+    axis.text.x          = element_text(angle = 90,vjust = .5),
+    panel.grid.minor     = element_blank(),
+    legend.direction     = "horizontal",
+    legend.position      = c(.01,.99),
+    legend.justification = c(0,1))
+```
+
+map of cases in beadplot
+
+```{r}
+# Load polygon of DK for plotting.
+dk_nuts2 <- read_delim(file = "../data/DK_NUTS2.txt", delim ="\t") %>%
+  mutate(Region = recode(id,
+    DK01 = "Capital",
+    DK02 = "Zealand",
+    DK03 = "South",
+    DK04 = "Central",
+    DK05 = "North"))
+
+# Connect samples with a location.
+df <- activate(grph_case_sub,nodes) %>% 
+  data.frame() %>% 
+  unnest(cols = nodes_in) %>%
+  left_join(meta_intro,by = c("nodes_in" = "ID")) %>%
+  select(ID_old,reglin_name,date) %>%
+  left_join(ssiTOcpr,by = "ID_old") %>%
+  left_join(
+    select(meta_wholeDK,CPR,Coordinate_x,Coordinate_y),
+    by = "CPR") %>%
+  filter(!(is.na(Coordinate_x) | is.na(Coordinate_y)))
+
+# Convert to lon/lat coordinates.
+noise <- .05
+lola <- st_as_sf(df,coords = c("Coordinate_x", "Coordinate_y")) %>%
+  st_set_crs(32632) %>% # WGS 84 / UTM zone 32N - EPGS:32632
+  st_transform(4326) %>%
+  st_coordinates() %>%
+  data.frame() %>%
+  `colnames<-`(c("long","lat")) %>%
+  mutate(long = long + runif(n(),min = -noise,max = noise)) %>%
+  mutate(lat  = lat + runif(n(),min = -noise,max = noise))
+  
+df_map <- bind_cols(df,lola) %>%
+  group_by(reglin_name) %>%
+  mutate(m_long = mean(long),m_lat =mean(lat))
+
+p_casemap <- ggplot() +
+  geom_polygon(
+    data        = dk_nuts2, 
+    inherit.aes = F, 
+    mapping     = aes(
+      x     = long, 
+      y     = lat,
+      group = group,
+      fill  = Region),
+    colour  = "white",
+    alpha   = .75,
+    size    = .1) +
+  scale_fill_manual(values = regioner_col) +
+  geom_point(
+   data        = df_map, 
+   inherit.aes = F, 
+   mapping     = aes(
+      x     = long, 
+      y     = lat),
+    size    = .5,colour = "black") +
+  geom_segment(
+   data        = df_map, 
+   inherit.aes = F,
+   mapping     = aes(x = m_long,y = m_lat,xend = long,yend = lat),
+   size        = .1) +
+ geom_point(
+   data        = select(df_map,m_long,m_lat,reglin_name) %>% unique(), 
+   inherit.aes = F, 
+   mapping     = aes(
+      x     = m_long, 
+      y     = m_lat),
+   colour = "red",
+   size   = 1.2,
+   shape = 20) +
+  geom_label_repel(
+   data        = select(df_map,m_long,m_lat,reglin_name) %>% unique(), 
+   inherit.aes = F, 
+   mapping     = aes(
+      x     = m_long, 
+      y     = m_lat,
+      label = reglin_name),
+   size               = 2,
+   segment.colour     = "red",
+   min.segment.length = 0,
+   segment.size       = .2,
+   label.padding      = .1) +
+  xlim(8,13) +
+  theme_void() +
+  theme(legend.position = "none",panel.grid = element_blank())
+```
+
+Combine into figure 2
+
+```{r}
+p1 <- plot_grid(
+  p_case_time,
+  p_casemap + theme(plot.margin = margin(t = 5.5,r = 14,b = 5.5,l = 14)),
+  nrow = 2,
+  labels = c("(B)","(C)"),
+  label_size = 10)
+
+p <- plot_grid(
+  p_tree,
+  p1,
+  nrow = 1,
+  labels = c("(A)",NULL),
+  label_size = 10)
+
+ggsave(p,file = "figures/fig2.png",dev = "png",dpi = 300,width = 6,height = 6)
+```
+
+## Supplementary figure 3
+
+```{r}
+# Identify the root node and all subset nodes.
+root_node <- select(g_vert,id,root_node) %>% filter(id == 107) %>% pull(root_node)
+all_nodes <- select(g_vert,id,root_node) %>% right_join(wh_nodes,by = "id")
+
+# Identify the cases that are in the clusters.
+wh_in_clust <- filter(g_vert,id %in% all_nodes$id) %>%
+  unnest(cols = nodes_in) %>%
+  pull(nodes_in)
+
+# Subset metadata to match tree.
+meta_casetree <- dplyr::filter(meta_intro) %>%
+  mutate(Region = factor(Region,levels = names(regioner_col)))
+
+# Time-tree.--------------------------------------------------------------------
+wh_tip_time <- as_tibble(tree_pastml) %>%
+  offspring(.node = root_node,tiponly = T) %>%
+  pull(label) 
+
+casetree_time <- keep.tip(tree_pastml,tip = wh_tip_time)
+
+nodelab_time <- as_tibble(casetree_time) %>%
+  right_join(all_nodes,by = c("label" = "root_node")) %>%
+  mutate(isCluster = "sub-lineage") %>%
+  select(node,reglin_name,isCluster)
+  
+casetreemeta_time <- ggtree(casetree_time,
+  as.Date = T,
+  mrsd    = max(meta_casetree$date),
+  colour  = "black",
+  size    = .2) %<+% meta_casetree %<+% nodelab_time
+
+p_time <- casetreemeta_time +
+  theme_tree2() +
+  geom_tippoint(aes(colour = Region),size = .5) +
+  scale_colour_manual(values = regioner_col,na.translate = F) +
+  geom_node_point(aes(shape = isCluster),colour = "red") +
+  geom_label_repel(aes(label = reglin_name),size = 2,colour = "red",nudge_x = -1000,nudge_y = 20,hjust = 1,fontface = "bold",min.segment.length = 0,label.size = NA,box.padding = unit(0,'lines')) +
+  scale_shape_manual(values = 19,na.translate = F) +
+  scale_x_date(breaks = brk_mth$date,labels = brk_mth$nm,expand = c(.1,.1)) 
+
+# Phylogenetic tree.------------------------------------------------------------
+tree_phy <- read.tree("bootstrap_1000iter/out.renamed.contree")
+
+# Need to remove the polytomy label.
+wh_tip_phy <- as_tibble(tree_phy) %>%
+  offspring(.node = sub("[.].*","",x = root_node),tiponly = T) %>%
+  pull(label) 
+
+casetree_phy  <- keep.tip(tree_phy,tip = wh_tip_phy)
+
+all_nodes_phy <- all_nodes %>%
+  mutate(root_node = sub("[.].*","",x = root_node)) %>%
+  group_by(root_node,suport) %>%
+  summarise(reglin_name = paste(reglin_name,collapse = "; "))
+
+nodelab_phy <- as_tibble(casetree_phy) %>%
+  right_join(all_nodes_phy,by = c("label" = "root_node")) %>%
+  mutate(txt = paste0(reglin_name," (",suport,"%)")) %>%
+  mutate(isCluster = "sub-lineage") %>%
+  select(node,txt,isCluster)
+
+casetreemeta_phy <- ggtree(casetree_phy,
+  colour  = "black",
+  size    = .2) %<+% meta_casetree %<+% nodelab_phy
+
+p_phy <- casetreemeta_phy +
+  theme_tree2() +
+  scale_x_continuous(breaks = seq(0,20)/29903,labels = seq(0,20),expand = c(.1,0,0,0)) +
+  geom_tippoint(aes(colour = Region),size = .5) +
+  scale_colour_manual(values = regioner_col,na.translate = F) +
+  geom_node_point(aes(shape = isCluster),colour = "red",show.legend = F) +
+  geom_label_repel(aes(label = txt),size = 2,colour = "red",nudge_x = -1000,nudge_y = 20,hjust = 1,fontface = "bold",min.segment.length = 0,label.size = NA,box.padding = unit(0,'lines')) +
+  scale_shape_manual(values = 19,na.translate = F) +
+  labs(x = "Substitutions")
+
+p_phy
+
+leg <- get_legend(p_phy + 
+  theme(legend.position = "bottom",legend.key.size = unit(.5,'lines')) + 
+  guides(colour = guide_legend(override.aes = list(size = 2))) + 
+  labs(colour = NULL))
+
+p1 <- plot_grid(
+  p_phy + theme(legend.position = "none"),
+  p_time + theme(legend.position = "none"),
+  align = "h",
+  axis  = "b",
+  labels     = c("(A)","(B)"),
+  label_size = 10)
+
+p <- plot_grid(p1,leg,nrow = 2,rel_heights = c(1,.1))
+
+ggsave(p,filename = "figures/time-and-phy-tree-case.png",width = 6,height = 8,dpi = 300)
+```
+
+## Travel data analysis
+
+Need to verify the introductions using travel history data. For assessing overall performance we use the DK-vs-nonDK analysis as this is more robust. To assess the ability to correctly predict travel from the genome we use an analysis where country is included. First, the DK-vs-nonDK data.
+
+```{r}
+# Prepare for merge with travel data.
+intro_by_period <- intros %>% 
+  ungroup() %>% 
+  select(id,no_desc,nodes_in,first_occur) %>%
+  unnest(cols = nodes_in) %>%
+  left_join(meta_intro,by = c("nodes_in" = "ID")) %>%
+  group_by(id) %>%
+  mutate(idx_date           = min(date)) %>%
+  mutate(DaysAfterFirstCase = as.numeric(date - idx_date)) %>%
+  ungroup() %>%
+  select(id,nodes_in,date,no_desc,DaysAfterFirstCase,idx_date)
+
+# Merge with travel data.
+travel_df <- left_join(intro_by_period,select(meta_intro,ID,ID_old),by = c("nodes_in" = "ID")) %>%
+  left_join(select(travel,ID_old,travel,country_to,groups),by = "ID_old")
+  
+# How many has travel data?
+travel_df %>% 
+  count(travel) %>%
+  mutate(pct = round(n/sum(n)*100,1))
+
+# What countries have been traveling to?
+ungroup(travel_df) %>%
+  filter(country_to != "") %>%
+  count(country_to) %>%
+  mutate(pct = round(n/sum(n)*100,1)) %>%
+  arrange(-pct) %>%
+  View()
+```
+
+
+```{r}
+################################################################################
+# How many introductions has traveled?
+################################################################################
+
+travel_sensi <- tran_clst %>%
+  mutate(DaysAfterFirstCase = as.numeric(date - idx_date)) %>%
+  mutate(introduced = ifelse(parent_state == "notDK","Introduction lineage","Transmission cluster")) %>%
+  mutate(introduced = factor(introduced,levels = c("Introduction lineage","Transmission cluster"))) %>%
+  nest(data = everything()) %>%
+  tidyr::expand(data,DayUntil = seq(0,30)) %>%
+  mutate(subdat = map2(data,DayUntil,
+    ~.x %>%
+      group_by(reglin_name) %>%
+      filter(DaysAfterFirstCase <= .y) %>%
+      group_by(reglin_name,duration,introduced) %>%
+      summarise(AnyTravel = ifelse(any(travel == "Yes",na.rm = T),"Yes","No")))) %>%
+  select(-data) %>%
+  unnest(cols = c(subdat)) %>% 
+  group_by(DayUntil,introduced) %>%
+  summarise(n_travel = sum(AnyTravel == "Yes"),pct = n_travel/n()*100,n_lineages = sum(duration >= DayUntil))
+
+p1 <- ggplot(travel_sensi,aes(x = DayUntil,y = pct,colour = introduced)) +
+  geom_step() +
+  labs(
+    x      = "Days since first occurence",
+    y      = "Travel history [%]",
+    colour = NULL) +
+  scale_colour_manual(values = c("Introduction lineage" = "#d1495b","Transmission cluster" = "#00798c")) +
+  scale_x_continuous(expand = expansion(add = .5)) +
+  scale_y_continuous(breaks = seq(0,50,10),limits = c(0,50),expand = c(0,0)) +
+  theme_bw(base_size = 8) +
+  theme(legend.position = "none",
+        panel.grid = element_blank())
+
+p2 <- ggplot(travel_sensi,aes(x = DayUntil,y = n_lineages,colour = introduced)) +
+  geom_line() +
+  labs(
+    x    = "Minimum duration in days",
+    y    = "No.",
+    colour = NULL) +
+  scale_colour_manual(values =c("Introduction lineage" = "#d1495b","Transmission cluster" = "#00798c")) +
+  scale_x_continuous(expand = expansion(add = 0)) +
+  scale_y_continuous(expand = c(0,0,.1,0),breaks = c(25,50,75,100)) +
+  theme_bw(base_size = 8) +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank())
+
+p_travelintro <- plot_grid(
+  p2 + theme(
+    legend.position      = c(.99,.99),
+    legend.justification = c(1,1),
+    legend.text          = element_text(size = 6),
+    legend.key.size      = unit(.5,'lines')),
+  p1,
+  #leg,
+  ncol = 1,
+  labels = c("(A)","(B)"),
+  label_size = 10,
+  label_x = -.02,
+  rel_heights = c(.6,1,.1),
+  align       = "v",
+  axis        = "lr")
+  
+p_travelintro
+
+ggsave(p_travelintro,filename = "figures/introductions-with-travel.png",dpi = 300,width = 4,height = 5)
+```
+
+## Correspondence travel and genomically inferred origin
+
+We performed an ancestral reconstruction using country as label for all international sequences. Load the results and compare to the actual travel history.
+
+```{r}
+# For counting no. of DK descendants.
+whDK <- filter(meta_intro,country == "Denmark") %>% pull(ID)
+
+# Read the pajek file into R.
+g_vert_country <- data.table::fread(
+  cmd       = "awk '/vert/{flag=1; next} /arcs/{flag=0} flag' pastml/by_country/B117_map.net",
+  col.names = c("id","root_node","nodes_in","state"),
+  sep       = " ") %>%
+  mutate(state = sub("country_region:","",state)) %>%
+  mutate(nodes_in = strsplit(nodes_in,split = ",")) %>%
+  tibble()
+
+# Map names of region to english.
+g_vert_country <- g_vert_country %>%
+  mutate(state = stringi::stri_replace_all_fixed(state,
+    pattern       = names(regTOeng),
+    replacement   = regTOeng,
+    vectorize_all = F)) %>%
+  mutate(state = sub("Sjaelland","Zealand",x = state))
+
+# Resolve ambigous states.
+g_vert_country <- mutate(g_vert_country,
+  state = strsplit(state,split = " or ") %>%
+    sapply(function(i){
+      ifelse(length(i) > 1,
+        ifelse(any(!i %in% regTOeng),paste(setdiff(i,regTOeng),collapse = " or "),"Denmark"),i)
+    }))
+
+# Need to be sure that no non-DK sequences are in the DK clusters.
+g_vert_country <- g_vert_country %>%
+  mutate(nodes_in = ifelse(sapply(nodes_in,length) > 0 & state != "notDK",
+    map(nodes_in,~intersect(.x,filter(meta_intro,country == "Denmark") %>% pull(ID))),
+    nodes_in))
+
+# summary stats of each cluster.
+clst_stat_country <- select(g_vert_country,id,state,nodes_in) %>% 
+  unnest(cols = nodes_in) %>%
+  left_join(meta_intro,by = c("nodes_in" = "ID")) %>%
+  group_by(id,state) %>%
+  summarise(
+    idx_case    = nodes_in[which.min(date)],
+    first_occur = min(date),
+    days        = as.numeric(max(date) - min(date)),
+    first_week  = sort(date_week_iso)[1],
+    last_week   = sort(date_week_iso,decreasing = T)[1],
+    no_desc     = n())
+
+g_vert_country <- left_join(g_vert_country,clst_stat_country,by = c("id","state")) %>%
+  mutate(no_desc = ifelse(is.na(no_desc),0,no_desc))
+
+# Split out the bootstrap support.
+g_vert_country <- g_vert_country %>%
+  mutate(suport = ifelse(root_node != "root" & no_desc > 1,sub("-.*","",x = root_node),NA))
+    
+# Load the links.
+g_edges_country  <- data.table::fread(
+  cmd       = "awk 'BEGIN {flag=0} /arcs/ {flag=1; next} flag' pastml/by_country/B117_map.net",
+  col.names = c("from","to"),
+  sep       = " ") %>%
+  tibble()
+
+# Make a nested naming structure.
+tmp1 <- data.tree::FromDataFrameNetwork(g_edges_country) %>%
+  data.tree::ToDataFrameTypeCol("pathString") %>%
+  pull(pathString) %>%
+  gsub("/","-",x = .)
+
+tmp2 <- tmp1 %>%
+  sapply(function(i){
+    vec <- strsplit(i,split = "-")[[1]]
+    sapply(-seq_len(length(vec)-1),head,x = vec) %>% sapply(paste,collapse = "-")
+  }) %>%
+  unlist() %>%
+  unique()
+
+lin_name_country <- union(tmp1,tmp2) %>%
+  gsub("^1-","",x = .) %>%
+  data.frame(lineage_name = .,stringsAsFactors = F) %>%
+  as_tibble() %>%
+  mutate(id = sapply(lineage_name,strsplit,split = "-") %>% sapply(tail,n = 1) %>% as.numeric())
+
+g_vert_country <- left_join(g_vert_country,lin_name_country,by = "id")
+
+# Create a graph.
+grph_country <- tbl_graph(nodes = g_vert_country,edges = g_edges_country,directed = T)
+
+# find parent states.
+x1 <- g_vert_country %>% dplyr::rename(parent_state = state) %>% select(id,parent_state)
+x2 <- g_vert_country %>% select(id,state,first_occur,nodes_in,idx_case)
+
+parent_states_country <- left_join(g_edges_country,x1,by = c("from" = "id")) %>%
+  left_join(x2,by = c("to" = "id")) %>%
+  select(-from) %>%
+  dplyr::rename(id = to) %>%
+  mutate(no_steps = as.numeric(shortest.paths(grph_country,v = 1,to = id)))
+  
+parent_states_DK_country <- parent_states_country %>% 
+  filter(state %in% c(regTOeng,"Denmark")) %>%
+  # Arrange by no_step.
+  arrange(no_steps)
+
+out_lst <- list()
+while(nrow(parent_states_DK_country) > 0){
+  wh_node   <- parent_states_DK_country$id[1]
+  wh_state  <- parent_states_DK_country$state[1]
+  wh_parent <- parent_states_DK_country$parent_state[1]
+  wh_case   <- parent_states_DK_country$idx_case[1]
+  
+  collapse_nodes <- neighborhood(grph_country,order = 10,nodes = wh_node,mode = "out")[[1]] %>% as.vector()
+  
+  to_add <- filter(parent_states_DK_country,id %in% collapse_nodes) %>%
+    summarise(
+      id          = wh_node,
+      state       = wh_state,
+      origin      = wh_parent,
+      no_desc     = sapply(nodes_in,length) %>% sum(),
+      nodes_in    = list(filter(g_vert_country,id %in% collapse_nodes) %>% pull(nodes_in) %>% unlist()),
+      first_occur = min(first_occur,na.rm = T),
+      idx_case    = idx_case[which.min(first_occur)])
+  
+  out_lst <- c(out_lst,list(to_add))
+  
+  parent_states_DK_country <- filter(parent_states_DK_country,!id %in% collapse_nodes)
+  print(nrow(parent_states_DK_country))
+}
+
+intros_country <- bind_rows(out_lst) %>%
+  mutate(date_week = ISOweek(first_occur) %>% factor(levels = c(paste0("2020-W",46:53),paste0("2021-W0",1:5)))) %>%
+  mutate(sizes     = cut(no_desc,breaks = c(0,1.5,5.5,Inf),labels = c("1","2-5",">5"))) %>%
+  mutate(sizes = factor(sizes,levels = c("1","2-5",">5"))) %>%
+  group_by(date_week) %>%
+  arrange(desc(sizes),state) %>%
+  mutate(n = 1:n())
+```
+
+Now merge with travel data.
+
+```{r}
+# Prepare for merge with travel data.
+intro_by_period_country <- intros_country %>% 
+  ungroup() %>% 
+  select(id,no_desc,nodes_in,first_occur,origin) %>%
+  unnest(cols = nodes_in) %>%
+  left_join(meta_intro,by = c("nodes_in" = "ID")) %>%
+  group_by(id) %>%
+  mutate(idx_date           = min(date)) %>%
+  mutate(DaysAfterFirstCase = as.numeric(date - idx_date)) %>%
+  ungroup() %>%
+  select(id,nodes_in,date,no_desc,DaysAfterFirstCase,idx_date,origin)
+
+# Merge with travel data.
+travel_df_country <- left_join(intro_by_period_country,select(meta_intro,ID,ID_old),by = c("nodes_in" = "ID")) %>%
+  left_join(select(travel,ID_old,travel,country_to,groups),by = "ID_old")
+  
+################################################################################
+# Do travel destination match the infered origin?
+################################################################################
+
+# We use 14 days as cutoff.
+intro_cut <- 14
+
+intros_travel_country <- travel_df_country %>%
+  mutate(DayUntil = intro_cut) %>%
+    group_by(id) %>%
+    mutate(duration = max(DaysAfterFirstCase)) %>%
+    filter(DaysAfterFirstCase <= DayUntil) %>%
+    group_by(id,duration) %>%
+    summarise(
+      AnyTravel    = ifelse(any(travel == "Yes",na.rm = T),"Yes","No"),
+      dest_country = country_to[country_to != ""] %>% unique() %>% paste(collapse = " or "),
+      dest_groups  = groups[groups != ""] %>% unique() %>% paste(collapse = " or ")) 
+  
+destVSgenom <- inner_join(intros_travel_country,intros_country,by = "id") %>%
+  ungroup() %>%
+  dplyr::rename(genom_country = origin) %>%
+  select(dest_country,dest_groups,genom_country,nodes_in,AnyTravel) %>%
+  mutate(genom_groups = strsplit(genom_country,split = " or ") %>% lapply(recode,!!!countryTOsubreg) %>% sapply(paste,collapse = " or ")) %>%
+  select(dest_country,genom_country,dest_groups,genom_groups,nodes_in,AnyTravel)
+
+# Accuracy country.
+destVSgenom %>%
+  filter(AnyTravel == "Yes") %>%
+  mutate(same = dest_country == genom_country) %>%
+  count(same) %>%
+  mutate(pct = n/sum(n)*100)
+
+destVSgenom %>%
+  filter(AnyTravel == "Yes") %>%
+  filter(dest_country != genom_country & (grepl(" or ",dest_country) | grepl(" or ",genom_country))) %>%
+  select(dest_country,genom_country)
+
+# Accuracy groups.
+destVSgenom %>%
+  filter(AnyTravel == "Yes") %>%
+  mutate(same = dest_groups == genom_groups) %>%
+  count(same) %>%
+  mutate(pct = n/sum(n)*100)
+
+destVSgenom %>%
+  filter(AnyTravel == "Yes") %>%
+  filter(dest_groups != genom_groups & (grepl(" or ",dest_groups) | grepl(" or ",genom_groups))) %>%
+  select(dest_groups,genom_groups)
+
+# Check first cases.
+wh_cases <- filter(tran_clst,reglin_name == "CA1") %>% arrange(date) %>% head(20) %>% pull(nodes_in)
+destVSgenom %>%
+  unnest(cols = nodes_in) %>%
+  filter(nodes_in %in% wh_cases)
+```
